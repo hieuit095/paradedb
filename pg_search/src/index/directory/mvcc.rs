@@ -26,7 +26,7 @@ use crate::postgres::storage::block::{
     bm25_max_free_space, FileEntry, MVCCEntry, SegmentMetaEntry, SegmentMetaEntryContent,
     SegmentMetaEntryImmutable, SegmentMetaEntryMutable,
 };
-use crate::postgres::storage::buffer::{BorrowedBuffer, BufferManager, PinnedBuffer};
+use crate::postgres::storage::buffer::{BorrowedBuffer, BufferManager, BufferAccessStrategy, PinnedBuffer};
 use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::storage::MAX_BUFFERS_TO_EXTEND_BY;
 use crate::schema::FieldSource;
@@ -68,6 +68,26 @@ pub enum MvccSatisfies {
     Snapshot,
     Vacuum,
     Mergeable,
+}
+
+/// Buffer access strategy for merge operations.
+/// This determines how buffers are accessed during segment merge operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeBufferAccessStrategy {
+    /// Sequential access pattern, optimized for sequential I/O
+    Sequential,
+    /// Random access pattern with prefetching
+    RandomAccess,
+    /// Access pattern optimized for bulk reads
+    BulkRead,
+    /// Default strategy using system heuristics
+    Default,
+}
+
+impl Default for MergeBufferAccessStrategy {
+    fn default() -> Self {
+        Self::Default
+    }
 }
 
 impl MvccSatisfies {
