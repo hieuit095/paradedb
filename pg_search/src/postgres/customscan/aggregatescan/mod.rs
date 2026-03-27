@@ -138,13 +138,29 @@ impl CustomScan for AggregateScan {
                     builder.build()
                 }
             }
-            PrivateData::DataFusion { .. } => {
+            PrivateData::DataFusion { ref topk, .. } => {
+                let has_topk = topk.is_some();
                 // For join aggregates, scanrelid=0 (no single base relation)
                 builder.set_scanrelid(0);
                 unsafe {
                     let mut cscan = builder.build();
-                    let plan = &mut cscan.scan.plan;
-                    replace_aggrefs_in_target_list(plan);
+
+                    // Set custom_scan_tlist so Postgres can resolve variable references
+                    // when Sort/Limit nodes are placed above this scanrelid=0 CustomScan.
+                    // This is a copy of the original targetlist (with Aggrefs intact) —
+                    // setrefs.c uses it to create INDEX_VAR references in parent nodes.
+                    let original_tlist = cscan.scan.plan.targetlist;
+                    cscan.custom_scan_tlist =
+                        pg_sys::copyObjectImpl(original_tlist.cast()).cast::<pg_sys::List>();
+
+                    if !has_topk {
+                        // No ORDER BY on aggregate: safe to replace Aggrefs at plan time
+                        let plan = &mut cscan.scan.plan;
+                        replace_aggrefs_in_target_list(plan);
+                    }
+                    // When topk is present: keep Aggrefs in plan.targetlist so Postgres's
+                    // make_sort_from_pathkeys can find them. Replacement is deferred to
+                    // create_custom_scan_state (execution time).
                     cscan
                 }
             }
@@ -744,7 +760,7 @@ impl AggregateScan {
 
     /// New DataFusion-backed aggregate path for JOINs.
     fn build_datafusion_aggregate_path(
-        builder: CustomPathBuilder<Self>,
+        mut builder: CustomPathBuilder<Self>,
     ) -> Vec<pg_sys::CustomPath> {
         use crate::postgres::customscan::aggregatescan::datafusion_build::{
             all_have_bm25_index, collect_join_agg_sources, extract_join_tree_from_parse,
@@ -808,13 +824,12 @@ impl AggregateScan {
         }
 
         // Detect ORDER BY on aggregate + LIMIT for TopK pushdown into DataFusion.
-        // NOTE: Currently disabled for join aggregates (scanrelid=0) because Postgres
-        // cannot handle Sort/Limit nodes above a scanrelid=0 CustomScan that outputs
-        // aggregate expressions. The infrastructure (TopKAggregateRule + TopKAggregateExec)
-        // is ready — this guard should be removed once pathkey support is added for the
-        // DataFusion aggregate path. See: https://github.com/paradedb/paradedb/issues/4493
-        let topk = None::<privdat::DataFusionTopK>;
-        let _topk_detected = unsafe { detect_join_aggregate_topk(builder.args(), &targetlist) };
+        // When detected, declare pathkeys so Postgres doesn't add a Sort node above us.
+        let topk = unsafe { detect_join_aggregate_topk(builder.args(), &targetlist) };
+        if topk.is_some() {
+            let root = builder.args().root;
+            builder = unsafe { builder.set_pathkeys((*root).query_pathkeys) };
+        }
 
         // Build the custom path with DataFusion private data
         vec![builder.build(PrivateData::DataFusion {
